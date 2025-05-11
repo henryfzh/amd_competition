@@ -51,122 +51,49 @@ CUDA_SRC = """
 #include <hip/amd_detail/amd_hip_fp8.h>
 #include <hip/amd_detail/amd_hip_bf16.h>
 
-constexpr int BM = 64;  // Block size for M dimension
-constexpr int BN = 64;  // Block size for N dimension
-constexpr int BK = 128; // Block size for K dimension
-constexpr int TM = 4;   // Thread tile size for M
-constexpr int TN = 4;   // Thread tile size for N
-constexpr int NUM_THREADS = 256;
+constexpr const int BLOCK = 128;
 
-__global__ void custom_kernel(const __hip_fp8_e4m3_fnuz* a, const __hip_fp8_e4m3_fnuz* b, 
-                              const float* as, const float* bs, 
-                              __hip_bfloat16* c, int m, int n, int k) {
+__global__ void custom_kernel(const __hip_fp8_e4m3_fnuz* a, const __hip_fp8_e4m3_fnuz* b, const float* as, const float* bs, 
+                   __hip_bfloat16* c, int m, int n, int k) {
                    
     // Your implementation here
-    __shared__ __hip_fp8_e4m3_fnuz a_shared[BM][BK];
-    __shared__ __hip_fp8_e4m3_fnuz b_shared[BN][BK];
-    __shared__ float a_scale_shared[BM];
-    __shared__ float b_scale_shared[BN/128];
-
-    int bx = blockIdx.x * BM;
-    int by = blockIdx.y * BN;
-    int tx = threadIdx.x;
-
-    // Each thread processes TMxTN elements
-    int row = bx + (tx / (BN/TN)) * TM;
-    int col = by + (tx % (BN/TN)) * TN;
-
-    float accum[TM][TN] = {0.0f};
-
-    for (int kb = 0; kb < k; kb += BK) {
-        // Load A block into shared memory with FP8 conversion
-        #pragma unroll
-        for (int i = 0; i < BM; i += NUM_THREADS) {
-            int load_row = i + tx;
-            if (load_row < BM) {
-                const uint8_t* a_ptr = &a[(kb)*m + (bx + load_row)];
-                a_shared[load_row][0] = *reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(a_ptr);
-            }
+    int cx = threadIdx.x + blockDim.x * blockIdx.x;
+    int cy = threadIdx.y + blockDim.y * blockIdx.y;
+    if(cx >= m || cy >= n) return;
+    
+    int sn = (n + BLOCK - 1) / BLOCK;
+    
+    float result = 0;
+    // split loop into an outer loop over different blocks, and an inner loop within one block.
+    // we can assume k % BLOCK == 0.
+    for(int i = 0; i < k; i += BLOCK) {
+        // block results accumulates the inner product across a single block.
+        // within each block, scales are constant, so we can lift the scaling 
+        // outside of the inner loop.
+        float block_result = 0;
+        for(int ii = 0; ii < BLOCK; ++ii) {
+            // load input matrix elements and convert to float for computations
+            float av = (float)a[cx + (i + ii) * m];
+            float bv = (float)b[cy + (i + ii) * n];
+            block_result += av * bv; 
         }
-
-        // Load B block into shared memory with FP8 conversion
-        #pragma unroll
-        for (int j = 0; j < BN; j += NUM_THREADS) {
-            int load_col = j + tx;
-            if (load_col < BN) {
-                const uint8_t* b_ptr = &b[(kb)*n + (by + load_col)];
-                b_shared[load_col][0] = *reinterpret_cast<const __hip_fp8_e4m3_fnuz*>(b_ptr);
-            }
-        }
-        __syncthreads();
-
-        // Load scales into shared memory
-        if (tx < BM) {
-            int scale_idx = kb/BK;
-            a_scale_shared[tx] = as[bx + tx + scale_idx*m];
-        }
-        if (tx < BN/128) {
-            int scale_idx = kb/BK;
-            b_scale_shared[tx] = bs[(by/128) + tx + scale_idx*(n/128)];
-        }
-        __syncthreads();
-
-        // Compute partial sums
-        #pragma unroll
-        for (int kk = 0; kk < BK; ++kk) {
-            __hip_fp8_e4m3_fnuz a_frag[TM];
-            __hip_fp8_e4m3_fnuz b_frag[TN];
-
-            // Load A fragment
-            #pragma unroll
-            for (int t = 0; t < TM; ++t)
-                a_frag[t] = a_shared[row - bx + t][kk];
-            
-            // Load B fragment
-            #pragma unroll
-            for (int t = 0; t < TN; ++t)
-                b_frag[t] = b_shared[col - by + t][kk];
-
-            // Compute with scaling
-            float scale = a_scale_shared[row - bx] * b_scale_shared[(col - by)/128];
-            #pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    accum[i][j] += static_cast<float>(a_frag[i]) * 
-                                  static_cast<float>(b_frag[j]) * scale;
-                }
-            }
-        }
-        __syncthreads();
+        
+        // before we can go to the next block, scale the result of the current block
+        // and accumulate to final result
+        // note the different indexing into as and bs
+        result += block_result * as[cx + i/BLOCK * m] * bs[cy/BLOCK + i/BLOCK * sn];
     }
-
-    // Store results as BFloat16
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            if ((row + i) < m && (col + j) < n) {
-                c[(row + i)*n + (col + j)] = c10::BFloat16(accum[i][j]);
-            }
-        }
-    }
+    
+    // finally, write the result as bf16
+    c[cx * n + cy] = (__hip_bfloat16)result;
 }
 
 void fp8_mm(torch::Tensor a, torch::Tensor b, torch::Tensor as, torch::Tensor bs, torch::Tensor c) {
     int m = a.size(0);
     int n = b.size(0);
     int k = a.size(1);
-    dim3 grid((m + BM - 1)/BM, (n + BN - 1)/BN);
-    dim3 block(NUM_THREADS);
-    
-    custom_kernel<<<grid, block, 0, 0>>>(a.data_ptr<__hip_fp8_e4m3_fnuz>(),
-                                  b.data_ptr<__hip_fp8_e4m3_fnuz>(),
-                                  as.data_ptr<float>(),
-                                  bs.data_ptr<float>(),
-                                  c.data_ptr<__hip_bfloat16>(),
-                                  m, n, k);
-
+    custom_kernel<<<dim3((m+15)/16, (n+15)/16), dim3(16, 16), 0, 0>>> ((__hip_fp8_e4m3_fnuz*)a.data_ptr(), (__hip_fp8_e4m3_fnuz*)b.data_ptr(), 
+    as.data_ptr<float>(), bs.data_ptr<float>(), (__hip_bfloat16*)c.data_ptr(), m, n, k);
     //C10_CUDA_CHECK(cudaGetLastError());
 }
 """
@@ -188,5 +115,3 @@ def custom_kernel(data: input_t) -> output_t:
     a, b, a_scale, b_scale, c = data
     module.fp8_mm(a, b, a_scale, b_scale, c)
     return c
-
-
